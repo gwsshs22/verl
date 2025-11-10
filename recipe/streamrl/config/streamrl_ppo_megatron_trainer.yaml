@@ -1,0 +1,13 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_megatron_trainer
+  - _self_
+
+rollout:
+  # Number of nodes used in the rollout
+  nnodes: 1
+  # Number of GPUs per node
+  n_gpus_per_node: 1
