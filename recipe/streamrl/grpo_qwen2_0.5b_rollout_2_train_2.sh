@@ -21,6 +21,10 @@ kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
 
+enable_overlong_buffer=True
+overlong_buffer_len=1024
+overlong_penalty_factor=1.0
+
 temperature=1.0
 top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
@@ -95,6 +99,11 @@ PYTHONUNBUFFERED=1 python3 -m recipe.streamrl.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     reward_model.reward_manager=dapo \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
+    +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
     trainer.logger=['console'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
