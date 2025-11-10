@@ -202,9 +202,8 @@ class TaskRunner:
         trainer.init_workers()
 
         # Start the training process.
-        # trainer.fit()
+        trainer.fit()
 
-        print("Done")
 
 
 

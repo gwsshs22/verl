@@ -16,6 +16,7 @@ from verl.workers.megatron_workers import ActorRolloutRefWorker as ARRWorker
 from verl.workers.megatron_workers import CriticWorker, RewardModelWorker
 from verl.workers.rollout import get_rollout_class
 
+from .distributed_util import stateless_init_process_group
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -31,6 +32,17 @@ class ActorRolloutRefWorker(ARRWorker):
             self._is_rollout = False
         self.role = role
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
+        rank = torch.distributed.get_rank() + rank_offset
+        self._weight_sync_group = stateless_init_process_group(
+            master_address,
+            master_port,
+            rank,
+            world_size,
+            get_torch_device().current_device(),
+        )
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_actor_weights_info(self):
         assert self._is_actor
@@ -43,6 +55,7 @@ class ActorRolloutRefWorker(ARRWorker):
             ret.append((key, tensor.size(), tensor.dtype))
 
         self._weights_info = ret
+
         return ret
 
     def _get_actor_params_generator(self):
@@ -63,6 +76,34 @@ class ActorRolloutRefWorker(ARRWorker):
             layer_name_mapping,
         )
         return generator
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def sync_rollout_weights(self):
+        assert (self._is_actor or self._is_rollout) and not self.config.hybrid_engine
+        assert hasattr(self, "_weights_info") and self._weights_info is not None
+
+        params_generator = self._get_actor_params_generator() if self._is_actor else None
+        if self._is_rollout:
+            inference_model = (
+                self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+            )
+            from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+
+            patch_vllm_moe_model_weight_loader(inference_model)
+        for key, shape, dtype in self._weights_info:
+            if self._is_actor:
+                weight_key, weight = next(params_generator)
+                assert key == weight_key
+                assert shape == weight.size()
+                assert dtype == weight.dtype
+
+            tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
+            if self._is_actor and torch.distributed.get_rank() == 0:
+                tensor.copy_(weight)
+
+            self._weight_sync_group.broadcast(tensor, src=0, stream=get_torch_device().current_stream())
+            if self._is_rollout:
+                inference_model.load_weights([(key, tensor)])
 
 class RolloutWorker(ActorRolloutRefWorker):
 
@@ -143,3 +184,7 @@ class RolloutWorker(ActorRolloutRefWorker):
     def set_actor_weights_info(self, weights_info):
         assert self._is_rollout
         self._weights_info = weights_info
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"), blocking=False)
+    def async_generate_sequences(self, *args, **kwargs):
+        return super().generate_sequences(*args, **kwargs)

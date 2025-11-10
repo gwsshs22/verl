@@ -22,6 +22,7 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask,
 )
+from verl.utils.debug import marked_timer
 
 from recipe.streamrl.utils import need_critic
 
@@ -184,8 +185,245 @@ class StreamrlRayTrainer(RayPPOTrainer):
         self.actor_wg.init_model()
         self.rollout_wg.init_model()
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
-
         weights_info = self.actor_wg.get_actor_weights_info()[0]
         self.rollout_wg.set_actor_weights_info(weights_info)
 
+        self.create_weight_sync_group()
+        self.sync_rollout_weights()
 
+    def create_weight_sync_group(self):
+        master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote())
+        master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
+        world_size = len(self.actor_wg.workers + self.rollout_wg.workers)
+        self.actor_wg.create_weight_sync_group(
+            master_address,
+            master_port,
+            0,
+            world_size,
+        )
+        ray.get(
+            self.rollout_wg.create_weight_sync_group(
+                master_address,
+                master_port,
+                len(self.actor_wg.workers),
+                world_size,
+            )
+        )
+
+    def sync_rollout_weights(self):
+        if not self.hybrid_engine:
+            self.actor_wg.sync_rollout_weights()
+            ray.get(self.rollout_wg.sync_rollout_weights())
+
+    def _create_continuous_iterator(self):
+        """
+        Create a continuous data iterator across epoch
+        """
+        for epoch in range(self.config.trainer.total_epochs):
+            iterator = iter(self.train_dataloader)
+            for batch_dict in iterator:
+                yield epoch, batch_dict
+
+
+    def _async_gen_next_batch(self, continuous_iterator):
+        """
+        Call parameter synchronization and asynchronous sequence generation.
+        """
+        try:
+            epoch, batch_dict = next(continuous_iterator)
+        except StopIteration:
+            return None
+        except Exception as e:
+            print(f"Error in async_gen_next_batch: {e}")
+            return None
+
+        # Create the initial batch from the data loader
+        batch = DataProto.from_single_dict(batch_dict)
+
+        # pop those keys for generation
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+        if "multi_modal_data" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("multi_modal_data")
+        if "raw_prompt" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("raw_prompt")
+        if "tools_kwargs" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("tools_kwargs")
+        if "interaction_kwargs" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("interaction_kwargs")
+
+        gen_batch = batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+        )
+        gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+
+        # sync weights from actor to rollout
+        self.sync_rollout_weights()
+
+        # async generation
+        gen_batch_output = self.rollout_wg.async_generate_sequences(gen_batch)
+
+        # Launch individual reward computations as each generation completes
+        future_reward = None
+        if self.config.reward_model.launch_reward_fn_async:
+            # Store the object reference and set up callback
+            future_reward = self._launch_individual_rewards.remote(
+                gen_batch_output, self.config, self.tokenizer, batch.non_tensor_batch
+            )
+
+        # Return the original, now-modified `batch` and the `future_reward`
+        return GenerationBatchFuture(epoch, batch, gen_batch_output, future_reward)
+
+    @staticmethod
+    @ray.remote
+    def _launch_individual_rewards(gen_batch_output, config, tokenizer, original_non_tensor_batch):
+        # Get generation results
+        gen_batch_result = gen_batch_output.get()
+
+        # Repeat non_tensor_batch to match the number of responses
+        n = config.actor_rollout_ref.rollout.n
+        repeated_non_tensor_batch = {}
+        for key, value in original_non_tensor_batch.items():
+            repeated_non_tensor_batch[key] = np.repeat(value, n, axis=0)
+
+        # Split into individual responses with preserved non_tensor_batch
+        responses_split = []
+        for i in range(len(gen_batch_result)):
+            response_data = gen_batch_result[i : i + 1]  # Get single response
+            # Add repeated non_tensor_batch values
+            for key in repeated_non_tensor_batch:
+                response_data.non_tensor_batch[key] = repeated_non_tensor_batch[key][i : i + 1]
+            responses_split.append(response_data)
+
+        # Launch async reward computation
+        reward_futures = [
+            compute_reward_async.remote(response_data, config, tokenizer) for response_data in responses_split
+        ]
+
+        # Wait for results and combine
+        results = ray.get(reward_futures)
+        rewards_list = [r[0] for r in results]
+        extras_list = [r[1] for r in results]
+
+        combined_reward_tensor = torch.cat(rewards_list, dim=0)
+        combined_extras_dict = {}
+        if extras_list and extras_list[0]:
+            for key in extras_list[0].keys():
+                combined_extras_dict[key] = [d[key] for d in extras_list if key in d]
+
+        return combined_reward_tensor, combined_extras_dict
+
+    def fit(self):
+        """
+        The training loop of PPO.
+        The driver process only need to call the compute functions of the worker group through RPC
+        to construct the PPO dataflow.
+        The light-weight advantage computation is done on the driver process.
+        """
+        from omegaconf import OmegaConf
+
+        from verl.utils.tracking import Tracking
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        self.global_steps = 0
+
+        # load checkpoint before doing anything
+        self._load_checkpoint()
+
+        # perform validation before training
+        # currently, we only support validation using the reward_function.
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            val_metrics = self._validate()
+            assert val_metrics, f"{val_metrics=}"
+            pprint(f"Initial validation metrics: {val_metrics}")
+            logger.log(data=val_metrics, step=self.global_steps)
+            if self.config.trainer.get("val_only", False):
+                return
+        
+        # add tqdm
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+        # we start from step 1
+        self.global_steps += 1
+        last_val_metrics = None
+
+        # across epoch iterator
+        continuous_iterator = self._create_continuous_iterator()
+        batch_data_future = None
+        is_first_step = True
+        while batch_data_future is not None or is_first_step:
+            is_first_step = False
+            do_profile = (
+                self.global_steps in self.config.global_profiler.steps
+                if self.config.global_profiler.steps is not None
+                else False
+            )
+            if do_profile:
+                self.actor_wg.start_profile()
+                if not self.hybrid_engine:
+                    self.rollout_wg.start_profile()
+                if self.use_reference_policy:
+                    self.ref_policy_wg.start_profile()
+                if self.use_critic:
+                    self.critic_wg.start_profile()
+                if self.use_rm:
+                    self.rm_wg.start_profile()
+
+            metrics = {}
+            timing_raw = {}
+            is_last_step = self.global_steps >= self.total_training_steps
+
+            with marked_timer("step", timing_raw):
+                with marked_timer("sync_rollout_weights", timing_raw, color="purple"):
+                    batch_data_future = self._async_gen_next_batch(continuous_iterator)
+
+                # wait for the previous batch
+                with marked_timer("wait_gen", timing_raw, color="red"):
+                    epoch, batch, gen_batch_output, future_reward = batch_data_future.get()
+                    timing_raw.update(gen_batch_output.meta_info["timing"])
+                    gen_batch_output.meta_info.pop("timing", None)
+                
+                return
+
+class GenerationBatchFuture:
+    """
+    Wrapper class for encapsulating batch generation results
+    """
+
+    def __init__(self, epoch, batch, gen_batch_output, future_reward=None):
+        """
+        :param epoch: current epoch
+        :param batch: Input batch data
+        :param gen_batch_output: Generated sequences from the main model (DataProtoFuture)
+        :param future_reward: Future for reward computation (optional)
+        """
+        self.epoch = epoch
+        self.batch = batch
+        self.gen_batch_output = gen_batch_output
+        self.future_reward = future_reward
+
+    def get(self):
+        """
+        Get the actual results by calling get() method on gen_batch_output
+
+        Returns:
+            tuple: (epoch, batch, gen_batch_result, future_reward)
+                - epoch: Current epoch
+                - batch: Original input batch data
+                - gen_batch_result: Result from gen_batch_output.get() or gen_batch_output itself
+                - future_reward: Future for reward computation if available, else None
+        """
+        # Call get() method on gen_batch_output if available
+        if hasattr(self.gen_batch_output, "get"):
+            gen_batch_result = self.gen_batch_output.get()
+        else:
+            gen_batch_result = self.gen_batch_output
+
+        return self.epoch, self.batch, gen_batch_result, self.future_reward
