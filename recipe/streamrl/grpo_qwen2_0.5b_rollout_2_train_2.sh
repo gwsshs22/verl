@@ -40,7 +40,7 @@ max_response_length=1024
 max_num_batched_tokens=$((max_prompt_length + max_response_length))
 max_num_batched_tokens=$((2 * max_num_batched_tokens))
 
-use_dynamic_bsz=True
+use_dynamic_bsz=False
 ref_offload=True
 actor_offload=False
 gen_tp=2
