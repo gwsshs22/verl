@@ -1,3 +1,4 @@
+import math
 import uuid
 from pprint import pprint
 
@@ -92,6 +93,7 @@ class StreamrlRayTrainer(RayPPOTrainer):
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name
         self.validation_generations_logger = ValidationGenerationsLogger()
+        self.pipeline_depth = max(1, int(getattr(self.config.trainer, "pipeline_depth", 1)))
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -240,6 +242,7 @@ class StreamrlRayTrainer(RayPPOTrainer):
     def _async_gen_next_batch(self, continuous_iterator):
         """
         Call parameter synchronization and asynchronous sequence generation.
+        Returns an iterable of futures, one per pipeline chunk.
         """
         try:
             epoch, batch_dict = next(continuous_iterator)
@@ -249,8 +252,9 @@ class StreamrlRayTrainer(RayPPOTrainer):
             print(f"Error in async_gen_next_batch: {e}")
             return None
 
-        # Create the initial batch from the data loader
         batch = DataProto.from_single_dict(batch_dict)
+        batch_size = len(batch)
+        batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(batch_size)], dtype=object)
 
         # pop those keys for generation
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -268,24 +272,31 @@ class StreamrlRayTrainer(RayPPOTrainer):
             batch_keys=batch_keys_to_pop,
             non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
         )
-        gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
-        # sync weights from actor to rollout
+        # Split into pipeline chunks
+        chunk_count = min(self.pipeline_depth, max(1, batch_size))
+        chunk_size = math.ceil(batch_size / chunk_count)
+        batch_chunks = batch.split(chunk_size)
+        gen_batch_chunks = gen_batch.split(chunk_size)
+
+        # sync weights from actor to rollout once per step
         self.sync_rollout_weights()
 
-        # async generation
-        gen_batch_output = self.rollout_wg.async_generate_sequences(gen_batch)
+        chunk_futures = []
+        rollout_repeat = self.config.actor_rollout_ref.rollout.n
+        for chunk_batch, chunk_gen_batch in zip(batch_chunks, gen_batch_chunks):
+            repeated_gen_chunk = chunk_gen_batch.repeat(repeat_times=rollout_repeat, interleave=True)
+            gen_batch_output = self.rollout_wg.async_generate_sequences(repeated_gen_chunk)
 
-        # Launch individual reward computations as each generation completes
-        future_reward = None
-        if self.config.reward_model.launch_reward_fn_async:
-            # Store the object reference and set up callback
-            future_reward = self._launch_individual_rewards.remote(
-                gen_batch_output, self.config, self.tokenizer, batch.non_tensor_batch
-            )
+            future_reward = None
+            if self.config.reward_model.launch_reward_fn_async:
+                future_reward = self._launch_individual_rewards.remote(
+                    gen_batch_output, self.config, self.tokenizer, chunk_batch.non_tensor_batch
+                )
 
-        # Return the original, now-modified `batch` and the `future_reward`
-        return GenerationBatchFuture(epoch, batch, gen_batch_output, future_reward)
+            chunk_futures.append(GenerationBatchFuture(epoch, chunk_batch, gen_batch_output, future_reward))
+
+        return GenerationPipelineFuture(chunk_futures)
 
     @staticmethod
     @ray.remote
@@ -325,6 +336,90 @@ class StreamrlRayTrainer(RayPPOTrainer):
                 combined_extras_dict[key] = [d[key] for d in extras_list if key in d]
 
         return combined_reward_tensor, combined_extras_dict
+
+    def _process_minibatch(self, batch, gen_batch_output, future_reward, metrics, timing_raw):
+        """Process a pipeline mini-batch up to (but not including) model updates."""
+        rollout_repeat = self.config.actor_rollout_ref.rollout.n
+        batch = batch.repeat(repeat_times=rollout_repeat, interleave=True)
+        batch = batch.union(gen_batch_output)
+        batch.batch["response_mask"] = compute_response_mask(batch)
+
+        reward_tensor = None
+        reward_extra_infos_dict = {}
+        with marked_timer("reward", timing_raw, color="yellow"):
+            if self.use_rm:
+                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                batch = batch.union(reward_tensor)
+
+            if self.config.reward_model.launch_reward_fn_async:
+                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+            else:
+                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+
+            if reward_extra_infos_dict is None:
+                reward_extra_infos_dict = {}
+
+        with marked_timer("old_log_prob", timing_raw, color="blue"):
+            print(f"[compute_log_prob] batch_size={len(batch)}.")
+            old_log_prob = self.actor_wg.compute_log_prob(batch)
+            batch = batch.union(old_log_prob)
+
+        if self.use_reference_policy:
+            with marked_timer("ref", timing_raw, color="olive"):
+                if not self.ref_in_actor:
+                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                else:
+                    ref_log_prob = self.actor_wg.compute_ref_log_prob(batch)
+                batch = batch.union(ref_log_prob)
+
+        if self.use_critic:
+            with marked_timer("values", timing_raw, color="cyan"):
+                values = self.critic_wg.compute_values(batch)
+                batch = batch.union(values)
+
+        with marked_timer("adv", timing_raw, color="brown"):
+            batch.batch["token_level_scores"] = reward_tensor
+            if reward_extra_infos_dict:
+                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+            if self.config.algorithm.use_kl_in_reward:
+                batch, kl_metrics = apply_kl_penalty(
+                    batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                )
+                metrics.update(kl_metrics)
+            else:
+                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+            batch, is_metrics = self.compute_rollout_importance_weights_and_add_to_batch(batch)
+            metrics.update(is_metrics)
+
+            norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
+            batch = compute_advantage(
+                batch,
+                adv_estimator=self.config.algorithm.adv_estimator,
+                gamma=self.config.algorithm.gamma,
+                lam=self.config.algorithm.lam,
+                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                config=self.config.algorithm,
+            )
+
+        return batch, reward_extra_infos_dict
+
+    @staticmethod
+    def _merge_reward_extra_infos(extra_infos_list):
+        merged = {}
+        for info in extra_infos_list:
+            for key, value in info.items():
+                merged.setdefault(key, []).extend(value)
+        return merged
+
+    @staticmethod
+    def _accumulate_remote_timing(timing_raw, remote_timing):
+        if not remote_timing:
+            return
+        for key, value in remote_timing.items():
+            timing_raw[key] = timing_raw.get(key, 0.0) + value
 
     def fit(self):
         """
@@ -391,60 +486,58 @@ class StreamrlRayTrainer(RayPPOTrainer):
             metrics = {}
             timing_raw = {}
             is_last_step = self.global_steps >= self.total_training_steps
+            epoch = None
+            batch = None
+            reward_extra_infos_dict: dict[str, list] | dict = {}
 
             with marked_timer("step", timing_raw):
                 with marked_timer("sync_rollout_weights", timing_raw, color="purple"):
                     batch_data_future = self._async_gen_next_batch(continuous_iterator)
 
-                with marked_timer("wait_gen", timing_raw, color="red"):
-                    epoch, batch, gen_batch_output, future_reward = batch_data_future.get()
-                    timing_raw.update(gen_batch_output.meta_info["timing"])
-                    gen_batch_output.meta_info.pop("timing", None)
+                if batch_data_future is None:
+                    break
 
+                processed_batches = []
+                reward_info_chunks = []
+                with marked_timer("gen_infer", timing_raw, color="red"):
+                    for chunk_future in batch_data_future:
+                        chunk_epoch, chunk_batch, gen_batch_output, future_reward = chunk_future.get()
+                        epoch = chunk_epoch if epoch is None else epoch
+                        self._accumulate_remote_timing(timing_raw, gen_batch_output.meta_info.get("timing"))
+                        gen_batch_output.meta_info.pop("timing", None)
 
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                )
-                # repeat to align with repeated responses in rollout
-                batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                batch = batch.union(gen_batch_output)
+                        chunk_batch, chunk_reward_infos = self._process_minibatch(
+                            chunk_batch,
+                            gen_batch_output,
+                            future_reward,
+                            metrics,
+                            timing_raw,
+                        )
+                        processed_batches.append(chunk_batch)
+                        if chunk_reward_infos:
+                            reward_info_chunks.append(chunk_reward_infos)
 
-                batch.batch["response_mask"] = compute_response_mask(batch)
-                # Balance the number of valid tokens across DP ranks.
-                # NOTE: This usually changes the order of data in the `batch`,
-                # which won't affect the advantage calculation (since it's based on uid),
-                # but might affect the loss calculation (due to the change of mini-batching).
-                # TODO: Decouple the DP balancing and mini-batching.
-                if self.config.trainer.balance_batch:
-                    self._balance_batch(batch, metrics=metrics)
+                    if not processed_batches:
+                        raise RuntimeError(
+                            "Mini-batch pipeline produced no processed chunks; generation or preprocessing failed"
+                        )
 
-                # compute global_valid tokens
-                batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    batch = DataProto.concat(processed_batches)
+                    reward_extra_infos_dict = self._merge_reward_extra_infos(reward_info_chunks)
 
-                with marked_timer("reward", timing_raw, color="yellow"):
-                    # compute reward model score
-                    if self.use_rm:
-                        reward_tensor = self.rm_wg.compute_rm_score(batch)
-                        batch = batch.union(reward_tensor)
+                    if self.config.trainer.balance_batch:
+                        self._balance_batch(batch, metrics=metrics)
 
-                    # Use the pre-launched future reward if available
-                    if self.config.reward_model.launch_reward_fn_async:
-                        # future_reward was already started in _async_gen_next_batch
-                        reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                    else:
-                        reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                # recompute old_log_probs
-                with marked_timer("old_log_prob", timing_raw, color="blue"):
-                    old_log_prob = self.actor_wg.compute_log_prob(batch)
-                    entropys = old_log_prob.batch["entropys"]
-                    response_masks = batch.batch["response_mask"]
-                    loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                    entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                    old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                    metrics.update(old_log_prob_metrics)
-                    old_log_prob.batch.pop("entropys")
-                    batch = batch.union(old_log_prob)
+                    if "entropys" in batch.batch.keys():
+                        entropys = batch.batch.pop("entropys")
+                        response_masks = batch.batch["response_mask"]
+                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                        entropy_agg = agg_loss(
+                            loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                        )
+                        metrics.update({"actor/entropy": entropy_agg.detach().item()})
 
                     if "rollout_log_probs" in batch.batch.keys():
                         # TODO: we may want to add diff of probs too.
@@ -469,57 +562,7 @@ class StreamrlRayTrainer(RayPPOTrainer):
                                 "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
                             }
                         )
-                if self.use_reference_policy:
-                    # compute reference log_prob
-                    with marked_timer("ref", timing_raw, color="olive"):
-                        if not self.ref_in_actor:
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                        else:
-                            ref_log_prob = self.actor_wg.compute_ref_log_prob(batch)
-                        batch = batch.union(ref_log_prob)
 
-                # compute values
-                if self.use_critic:
-                    with marked_timer("values", timing_raw, color="cyan"):
-                        values = self.critic_wg.compute_values(batch)
-                        batch = batch.union(values)
-                with marked_timer("adv", timing_raw, color="brown"):
-                    # we combine with rule-based rm
-                    reward_extra_infos_dict: dict[str, list]
-                    batch.batch["token_level_scores"] = reward_tensor
-
-                    if reward_extra_infos_dict:
-                        batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-                    # compute rewards. apply_kl_penalty if available
-                    if self.config.algorithm.use_kl_in_reward:
-                        batch, kl_metrics = apply_kl_penalty(
-                            batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                        )
-                        metrics.update(kl_metrics)
-                    else:
-                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                    # Compute rollout IS weights and mismatch metrics (inherited from RayPPOTrainer)
-                    batch, is_metrics = self.compute_rollout_importance_weights_and_add_to_batch(batch)
-                    # IS and mismatch metrics already have mismatch/ prefix
-                    metrics.update(is_metrics)
-
-                    # compute advantages, executed on the driver process
-
-                    norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                        "norm_adv_by_std_in_grpo", True
-                    )  # GRPO adv normalization factor
-
-                    batch = compute_advantage(
-                        batch,
-                        adv_estimator=self.config.algorithm.adv_estimator,
-                        gamma=self.config.algorithm.gamma,
-                        lam=self.config.algorithm.lam,
-                        num_repeat=self.config.actor_rollout_ref.rollout.n,
-                        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                        config=self.config.algorithm,
-                    )
                 # update critic
                 if self.use_critic:
                     with marked_timer("update_critic", timing_raw, color="pink"):
@@ -533,6 +576,7 @@ class StreamrlRayTrainer(RayPPOTrainer):
                     with marked_timer("update_actor", timing_raw, color="red"):
                         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                         actor_output = self.actor_wg.update_actor(batch)
+                    print(f"[update_actor] batch_size={len(batch)}.")
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
 
@@ -645,3 +689,19 @@ class GenerationBatchFuture:
             gen_batch_result = self.gen_batch_output
 
         return self.epoch, self.batch, gen_batch_result, self.future_reward
+
+
+class GenerationPipelineFuture:
+    """A thin iterable wrapper over multiple GenerationBatchFuture objects."""
+
+    def __init__(self, chunk_futures: list[GenerationBatchFuture]):
+        self._chunk_futures = chunk_futures
+
+    def __iter__(self):
+        return iter(self._chunk_futures)
+
+    def __len__(self):
+        return len(self._chunk_futures)
+
+    def __bool__(self):
+        return bool(self._chunk_futures)

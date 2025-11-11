@@ -124,6 +124,8 @@ trainer:
   device: cuda
   # Directory for logging rollout data; no dump if null
   rollout_data_dir: null
+  # Number of pipeline chunks the trainer should iterate through per batch
+  pipeline_depth: 1
 
 global_profiler:
   _target_: verl.utils.profiler.ProfilerConfig

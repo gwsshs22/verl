@@ -31,10 +31,11 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
 # parallelism/batch config
-train_prompt_bsz=8
-train_prompt_mini_bsz=4
+train_prompt_bsz=512
+train_prompt_mini_bsz=32
+train_pipeline_depth=4
 
-n_resp_per_prompt=4
+n_resp_per_prompt=1
 max_prompt_length=1024
 max_response_length=1024
 max_num_batched_tokens=$((max_prompt_length + max_response_length))
@@ -72,7 +73,7 @@ PYTHONUNBUFFERED=1 python3 -m recipe.streamrl.main_ppo \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.actor.megatron.param_offload=${actor_offload} \
     actor_rollout_ref.actor.megatron.optimizer_offload=${actor_offload} \
     actor_rollout_ref.actor.megatron.grad_offload=${actor_offload} \
@@ -117,5 +118,6 @@ PYTHONUNBUFFERED=1 python3 -m recipe.streamrl.main_ppo \
     trainer.log_val_generations=10 \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=1 \
+    trainer.pipeline_depth=$train_pipeline_depth \
     rollout.nnodes=1 \
     rollout.n_gpus_per_node=1
