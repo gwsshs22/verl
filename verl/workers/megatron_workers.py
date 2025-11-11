@@ -199,7 +199,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
             get_torch_device().set_device(rank)
-
+            print(f"Role={role}")
             mpu.initialize_model_parallel(
                 tensor_model_parallel_size=self.config.actor.megatron.tensor_model_parallel_size,
                 pipeline_model_parallel_size=self.config.actor.megatron.pipeline_model_parallel_size,
@@ -210,6 +210,28 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 expert_tensor_parallel_size=self.config.actor.megatron.expert_tensor_parallel_size,
                 nccl_communicator_config_path=None,
             )
+            # if role not in ["rollout"]:
+            #     mpu.initialize_model_parallel(
+            #         tensor_model_parallel_size=self.config.actor.megatron.tensor_model_parallel_size,
+            #         pipeline_model_parallel_size=self.config.actor.megatron.pipeline_model_parallel_size,
+            #         virtual_pipeline_model_parallel_size=self.config.actor.megatron.virtual_pipeline_model_parallel_size,
+            #         use_sharp=False,
+            #         context_parallel_size=self.config.actor.megatron.context_parallel_size,
+            #         expert_model_parallel_size=self.config.actor.megatron.expert_model_parallel_size,
+            #         expert_tensor_parallel_size=self.config.actor.megatron.expert_tensor_parallel_size,
+            #         nccl_communicator_config_path=None,
+            #     )
+            # else:
+            #     mpu.initialize_model_parallel(
+            #         tensor_model_parallel_size=self.config.rollout.tensor_model_parallel_size,
+            #         pipeline_model_parallel_size=1, # rollout vllm pp not supported yet
+            #         virtual_pipeline_model_parallel_size=None,
+            #         use_sharp=False,
+            #         context_parallel_size=1,
+            #         expert_model_parallel_size=1,
+            #         expert_tensor_parallel_size=1,
+            #         nccl_communicator_config_path=None,
+            #     )
 
         is_collect = (
             mpu.get_tensor_model_parallel_rank() == 0

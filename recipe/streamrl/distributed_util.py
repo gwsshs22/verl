@@ -35,6 +35,9 @@ def stateless_init_process_group(master_address, master_port, rank, world_size, 
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.utils import StatelessProcessGroup
 
+    print(f"master_address={master_address}, master_port={master_port}, rank={rank}, world_size={world_size}, device={device}", flush=True)
+    import time
+    time.sleep(3)
     pg = StatelessProcessGroup.create(host=master_address, port=master_port, rank=rank, world_size=world_size)
     pynccl = PyNcclCommunicator(pg, device=device)
     return pynccl

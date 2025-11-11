@@ -18,8 +18,8 @@ loss_agg_mode="token-mean"
 adv_estimator=grpo
 use_kl_in_reward=False
 kl_coef=0.0
-use_kl_loss=False
-kl_loss_coef=0.0
+use_kl_loss=True
+kl_loss_coef=0.001
 
 enable_overlong_buffer=True
 overlong_buffer_len=1024
@@ -33,7 +33,7 @@ val_top_p=0.7
 # parallelism/batch config
 train_prompt_bsz=512
 train_prompt_mini_bsz=32
-train_pipeline_depth=4
+train_pipeline_depth=2
 
 n_resp_per_prompt=1
 max_prompt_length=1024
