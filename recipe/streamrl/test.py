@@ -21,9 +21,12 @@ def _set_device_from_ray(device_type: str, fallback_rank: int) -> torch.device:
         gpu_ids = ray.get_gpu_ids()
         if not gpu_ids:
             raise RuntimeError("Ray actor did not receive a CUDA device.")
-        device_index = int(gpu_ids[0])
-        torch.cuda.set_device(device_index)
-        return torch.device("cuda", device_index)
+        # Ray exposes physical GPU ids, but the actor's CUDA_VISIBLE_DEVICES is
+        # remapped to a contiguous local range starting from 0. Use the local
+        # index to avoid invalid device ordinals.
+        torch.cuda.set_device(0)
+        print(f"Ray assigned physical GPU id(s) {gpu_ids}; using logical cuda:0 inside the actor.", flush=True)
+        return torch.device("cuda", 0)
     torch.npu.set_device(fallback_rank)
     return torch.device("npu", fallback_rank)
 
