@@ -22,7 +22,7 @@ use_kl_loss=True
 kl_loss_coef=0.001
 
 enable_overlong_buffer=True
-overlong_buffer_len=1024
+overlong_buffer_len=2048
 overlong_penalty_factor=1.0
 
 temperature=1.0
@@ -37,15 +37,15 @@ train_pipeline_depth=1
 
 n_resp_per_prompt=1
 max_prompt_length=1024
-max_response_length=1024
+max_response_length=4096
 max_num_batched_tokens=$((max_prompt_length + max_response_length))
-max_num_batched_tokens=$((2 * max_num_batched_tokens))
+max_num_batched_tokens=$((3 * max_num_batched_tokens))
 
 use_dynamic_bsz=False
 ref_offload=True
 actor_offload=False
 gen_tp=2
-train_tp=2
+train_tp=4
 train_pp=1
 
 PYTHONUNBUFFERED=1 python3 -m recipe.streamrl.main_ppo \
@@ -120,7 +120,7 @@ PYTHONUNBUFFERED=1 python3 -m recipe.streamrl.main_ppo \
     trainer.resume_mode=auto \
     trainer.log_val_generations=10 \
     trainer.nnodes=1 \
-    trainer.n_gpus_per_node=2 \
+    trainer.n_gpus_per_node=4 \
     trainer.pipeline_depth=$train_pipeline_depth \
     rollout.nnodes=1 \
     rollout.n_gpus_per_node=2
