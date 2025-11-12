@@ -34,17 +34,14 @@ class ActorRolloutRefWorker(ARRWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
-        print("11111111", flush=True)
         rank = torch.distributed.get_rank() + rank_offset
-        print("2222222", flush=True)
-        print(f"master_address={master_address}, master_port={master_port}, rank={rank}, world_size={world_size}, device={get_torch_device().current_device()}", flush=True)
-        # self._weight_sync_group = stateless_init_process_group(
-        #     master_address,
-        #     master_port,
-        #     rank,
-        #     world_size,
-        #     get_torch_device().current_device(),
-        # )
+        self._weight_sync_group = stateless_init_process_group(
+            master_address,
+            master_port,
+            rank,
+            world_size,
+            get_torch_device().current_device(),
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_actor_weights_info(self):
